@@ -205,27 +205,34 @@ services:
 
   spark-master:
     image: spark:python3-java17
+    env_file:
+      - .env
     command:
       - /opt/spark/bin/spark-class
       - org.apache.spark.deploy.master.Master
     environment:
+      HOME: /tmp/spark
       SPARK_NO_DAEMONIZE: "true"
     ports:
       - "7077:7077"
       - "8081:8080"
     volumes:
       - ./spark:/opt/fincore/spark
+      - spark-ivy-cache:/tmp/spark/.ivy2
     restart: unless-stopped
     networks:
       - fincore-network
 
   spark-worker:
     image: spark:python3-java17
+    env_file:
+      - .env
     command:
       - /opt/spark/bin/spark-class
       - org.apache.spark.deploy.worker.Worker
       - spark://spark-master:7077
     environment:
+      HOME: /tmp/spark
       SPARK_NO_DAEMONIZE: "true"
       SPARK_WORKER_CORES: "2"
       SPARK_WORKER_MEMORY: 2g
@@ -235,6 +242,7 @@ services:
       - "8082:8081"
     volumes:
       - ./spark:/opt/fincore/spark
+      - spark-ivy-cache:/tmp/spark/.ivy2
     restart: unless-stopped
     networks:
       - fincore-network
@@ -247,3 +255,4 @@ volumes:
   minio-data:
   warehouse-db-data:
   airflow-db-data:
+  spark-ivy-cache:
