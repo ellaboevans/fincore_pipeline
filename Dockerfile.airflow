@@ -2,15 +2,26 @@ FROM apache/airflow:2.10.5-python3.11
 
 USER root
 
+# Install system dependencies
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends docker.io \
+    && apt-get install -y --no-install-recommends docker.io git \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+# Switch to airflow user BEFORE copying files to ensure correct ownership
 USER airflow
 
-COPY requirements.txt /requirements.txt
+# Copy the file into the airflow user's home directory
+COPY --chown=airflow:root requirements.txt /opt/airflow/requirements.txt
 
+# Install python dependencies safely. dbt is installed into its own
+# isolated venv rather than the Airflow environment: dbt-core's dependency
+# tree (click, protobuf, sqlparse, mashumaro, ...) conflicts with Airflow's
+# pinned versions of the same packages, which makes a combined pip resolve
+# explode (ResolutionTooDeep).
 RUN pip install --no-cache-dir \
     "apache-airflow==2.10.5" \
-    -r /requirements.txt
+    -r /opt/airflow/requirements.txt \
+    && python -m venv /opt/airflow/dbt_venv \
+    && /opt/airflow/dbt_venv/bin/pip install --no-cache-dir "dbt-postgres==1.9.1" \
+    && ln -s /opt/airflow/dbt_venv/bin/dbt /home/airflow/.local/bin/dbt
