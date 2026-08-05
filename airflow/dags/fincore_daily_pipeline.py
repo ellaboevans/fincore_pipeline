@@ -7,6 +7,16 @@ from typing import Any
 
 import os
 import boto3
+import io
+import csv
+
+from contextlib import closing
+from urllib.parse import urlparse
+
+import pandas as pd
+import pyarrow.dataset as ds
+import pyarrow.fs as pafs
+import psycopg2
 
 from airflow import DAG
 from airflow.exceptions import AirflowException
@@ -14,7 +24,10 @@ from airflow.operators.bash import BashOperator
 from airflow.operators.empty import EmptyOperator
 from airflow.operators.python import BranchPythonOperator, PythonOperator
 from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
+from airflow.utils.task_group import TaskGroup
+from airflow.utils.trigger_rule import TriggerRule
 from botocore.client import Config
+
 
 
 LOGGER = logging.getLogger(__name__)
@@ -27,10 +40,161 @@ PROCESSED_BUCKET = "fincore-processed"
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT")
 MINIO_REGION = os.getenv("MINIO_REGION")
 
+MINIO_ENDPOINT = os.getenv(
+    "MINIO_ENDPOINT",
+    "http://minio:9000",
+)
+
+MINIO_REGION = os.getenv(
+    "MINIO_REGION",
+    "us-east-1",
+)
+
+WAREHOUSE_HOST = os.getenv(
+    "WAREHOUSE_HOST",
+    "warehouse-db",
+)
+
+WAREHOUSE_DB = os.getenv(
+    "WAREHOUSE_DB",
+    "fincore_warehouse",
+)
+
+WAREHOUSE_USER = os.getenv(
+    "WAREHOUSE_USER",
+    "fincore_user",
+)
+
+WAREHOUSE_PASSWORD = os.getenv(
+    "WAREHOUSE_PASSWORD",
+)
+
+WAREHOUSE_PORT = int(os.getenv("WAREHOUSE_PORT", "5432"))
+
 AWS_CONN_ID = "minio_s3"
 
 TRADE_REJECT_RATE_THRESHOLD = 0.02
 PNL_UNRESOLVABLE_THRESHOLD = 100
+
+WAREHOUSE_LOADS = {
+    "processed_trades": {
+        "source_prefix": "processed/trades",
+        "target_table": "raw.processed_trades",
+        "partition_column": "trade_date",
+        "columns": [
+            "order_id",
+            "portfolio_id",
+            "symbol",
+            "side",
+            "quantity",
+            "trade_price",
+            "average_cost",
+            "currency",
+            "transact_time",
+            "trade_date",
+            "close_price",
+            "market_currency",
+            "fx_rate_to_usd",
+            "realized_pnl_local",
+            "realized_pnl_usd",
+            "pnl_unresolvable",
+        ],
+    },
+    "portfolio_pnl": {
+        "source_prefix": "processed/portfolio_pnl",
+        "target_table": "raw.portfolio_pnl",
+        "partition_column": "pnl_date",
+        "columns": [
+            "portfolio_id",
+            "portfolio_name",
+            "pnl_date",
+            "position_count",
+            "total_market_value_usd",
+            "total_unrealized_pnl_usd",
+            "max_market_value_usd",
+            "max_daily_loss_usd",
+            "max_position_concentration_pct",
+            "market_value_limit_breached",
+            "daily_loss_limit_breached",
+        ],
+    },
+    "rejected_records": {
+        "source_prefix": "rejected",
+        "target_table": "raw.rejected_records",
+        "partition_column": "run_date",
+        "columns": [
+            "source_name",
+            "run_date",
+            "record_identifier",
+            "raw_record",
+            "rejection_rule",
+            "rejection_reason",
+            "rejected_at",
+        ],
+    },
+    "unresolvable_pnl": {
+        "source_prefix": "processed/unresolvable_pnl",
+        "target_table": "raw.unresolvable_pnl",
+        "partition_column": "trade_date",
+        "columns": [
+            "order_id",
+            "portfolio_id",
+            "symbol",
+            "side",
+            "quantity",
+            "trade_price",
+            "average_cost",
+            "currency",
+            "transact_time",
+            "trade_date",
+            "unresolvable_reason",
+        ],
+    },
+}
+
+
+def get_warehouse_connection():
+    if not WAREHOUSE_PASSWORD:
+        raise AirflowException(
+            "WAREHOUSE_PASSWORD is not available in the airflow container."
+        )
+    
+    return psycopg2.connect(
+        host=WAREHOUSE_HOST,
+        port=WAREHOUSE_PORT,
+        dbname=WAREHOUSE_DB,
+        user=WAREHOUSE_USER,
+        password=WAREHOUSE_PASSWORD,
+        connect_timeout=15
+    )
+    
+def get_pyarrow_s3_filesystem() -> pafs.S3FileSystem:
+    access_key = os.getenv("MINIO_ROOT_USER")
+    secret_key = os.getenv("MINIO_ROOT_PASSWORD")
+    
+    if not access_key or not secret_key:
+        raise AirflowException(
+            "MinIO credentials are not available."
+        )
+        
+    endpoint = MINIO_ENDPOINT or "http://minio:9000"
+    parsed_endpoint = urlparse(endpoint)
+    
+    endpoint_override = (
+        parsed_endpoint.netloc
+        if parsed_endpoint.scheme in ("http", "https")
+        else endpoint
+    )
+    
+    scheme = parsed_endpoint.scheme or "http"
+    
+    return pafs.S3FileSystem(
+        endpoint_override=endpoint_override,
+        access_key=access_key,
+        secret_key=secret_key,
+        region=MINIO_REGION,
+        scheme=scheme
+    )
 
 
 def failure_callback(context: dict[str, Any]) -> None:
@@ -323,7 +487,6 @@ def choose_quality_gate_branch(**context: Any) -> str:
 
     return "quality_gate_failed"
 
-
 def quality_failure(**context: Any) -> None:
     task_instance = context["ti"]
 
@@ -336,6 +499,396 @@ def quality_failure(**context: Any) -> None:
         f"blocked. Metrics: {json.dumps(metrics)}"
     )
 
+def read_parquet_partition(
+    *,
+    source_prefix: str,
+    run_date: str,
+) -> pd.DataFrame:
+    filesystem = get_pyarrow_s3_filesystem()
+
+    partition_path = (
+        f"{PROCESSED_BUCKET}/"
+        f"{source_prefix}/"
+        f"dt={run_date}"
+    )
+
+    LOGGER.info(
+        "Reading Parquet partition from s3://%s",
+        partition_path,
+    )
+
+    try:
+        dataset = ds.dataset(
+            partition_path,
+            filesystem=filesystem,
+            format="parquet",
+        )
+
+        table = dataset.to_table()
+
+    except Exception as exc:
+        raise AirflowException(
+            f"Unable to read Parquet partition "
+            f"s3://{partition_path}: {exc}"
+        ) from exc
+
+    dataframe = table.to_pandas()
+
+    LOGGER.info(
+        "Read %s rows from s3://%s",
+        len(dataframe),
+        partition_path,
+    )
+
+    return dataframe
+
+def prepare_dataframe_for_copy(
+    dataframe: pd.DataFrame,
+    expected_columns: list[str],
+) -> pd.DataFrame:
+    missing_columns = [
+        column
+        for column in expected_columns
+        if column not in dataframe.columns
+    ]
+
+    if missing_columns:
+        raise AirflowException(
+            "Parquet output is missing required columns: "
+            + ", ".join(missing_columns)
+        )
+
+    prepared = dataframe.loc[:, expected_columns].copy()
+
+    # PostgreSQL COPY accepts empty fields as NULL when configured.
+    prepared = prepared.astype(object)
+    prepared = prepared.where(pd.notna(prepared), None)
+
+    return prepared
+
+def copy_dataframe_to_postgres(
+    *,
+    cursor,
+    dataframe: pd.DataFrame,
+    target_table: str,
+    columns: list[str],
+) -> int:
+    if dataframe.empty:
+        LOGGER.warning(
+            "No rows available for %s; COPY will be skipped.",
+            target_table,
+        )
+        return 0
+
+    buffer = io.StringIO()
+
+    dataframe.to_csv(
+        buffer,
+        index=False,
+        header=False,
+        quoting=csv.QUOTE_MINIMAL,
+        na_rep="\\N",
+        date_format="%Y-%m-%d %H:%M:%S.%f%z",
+    )
+
+    buffer.seek(0)
+
+    column_sql = ", ".join(
+        f'"{column}"'
+        for column in columns
+    )
+
+    copy_sql = f"""
+        COPY {target_table} ({column_sql})
+        FROM STDIN
+        WITH (
+            FORMAT CSV,
+            NULL '\\N',
+            QUOTE '"',
+            ESCAPE '"'
+        )
+    """
+
+    cursor.copy_expert(
+        sql=copy_sql,
+        file=buffer,
+    )
+
+    return len(dataframe)
+
+def start_load_audit(
+    *,
+    cursor,
+    dag_id: str,
+    airflow_run_id: str,
+    run_date: str,
+    target_table: str,
+    source_path: str,
+) -> int:
+    cursor.execute(
+        """
+        INSERT INTO audit.pipeline_load_log (
+            dag_id,
+            airflow_run_id,
+            run_date,
+            target_table,
+            source_path,
+            load_status,
+            started_at
+        )
+        VALUES (%s, %s, %s, %s, %s, 'RUNNING', NOW())
+        RETURNING load_id
+        """,
+        (
+            dag_id,
+            airflow_run_id,
+            run_date,
+            target_table,
+            source_path,
+        ),
+    )
+
+    return int(cursor.fetchone()[0])
+
+
+def complete_load_audit(
+    *,
+    cursor,
+    load_id: int,
+    rows_deleted: int,
+    rows_inserted: int,
+) -> None:
+    cursor.execute(
+        """
+        UPDATE audit.pipeline_load_log
+        SET
+            rows_deleted = %s,
+            rows_inserted = %s,
+            load_status = 'SUCCESS',
+            completed_at = NOW()
+        WHERE load_id = %s
+        """,
+        (
+            rows_deleted,
+            rows_inserted,
+            load_id,
+        ),
+    )
+
+
+def record_failed_load_audit(
+    *,
+    dag_id: str,
+    airflow_run_id: str,
+    run_date: str,
+    target_table: str,
+    source_path: str,
+    error_message: str,
+) -> None:
+    try:
+        with closing(get_warehouse_connection()) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO audit.pipeline_load_log (
+                        dag_id,
+                        airflow_run_id,
+                        run_date,
+                        target_table,
+                        source_path,
+                        rows_deleted,
+                        rows_inserted,
+                        load_status,
+                        started_at,
+                        completed_at,
+                        error_message
+                    )
+                    VALUES (
+                        %s,
+                        %s,
+                        %s,
+                        %s,
+                        %s,
+                        0,
+                        0,
+                        'FAILED',
+                        NOW(),
+                        NOW(),
+                        %s
+                    )
+                    """,
+                    (
+                        dag_id,
+                        airflow_run_id,
+                        run_date,
+                        target_table,
+                        source_path,
+                        error_message[:5000],
+                    ),
+                )
+
+            connection.commit()
+
+    except Exception:
+        LOGGER.exception(
+            "Unable to record failed load audit for %s",
+            target_table,
+        )
+
+def load_partition_to_warehouse(
+    *,
+    load_name: str,
+    **context: Any,
+) -> dict[str, Any]:
+    if load_name not in WAREHOUSE_LOADS:
+        raise AirflowException(
+            f"Unknown warehouse load configuration: {load_name}"
+        )
+
+    config = WAREHOUSE_LOADS[load_name]
+
+    task_instance = context["ti"]
+    dag_run = context["dag_run"]
+
+    run_date = task_instance.xcom_pull(
+        task_ids="resolve_run_date",
+    )
+
+    target_table = config["target_table"]
+    partition_column = config["partition_column"]
+    expected_columns = config["columns"]
+    source_prefix = config["source_prefix"]
+
+    source_path = (
+        f"s3://{PROCESSED_BUCKET}/"
+        f"{source_prefix}/"
+        f"dt={run_date}/"
+    )
+
+    dataframe = read_parquet_partition(
+        source_prefix=source_prefix,
+        run_date=run_date,
+    )
+
+    dataframe = prepare_dataframe_for_copy(
+        dataframe,
+        expected_columns,
+    )
+
+    load_id: int | None = None
+
+    try:
+        with closing(get_warehouse_connection()) as connection:
+            connection.autocommit = False
+
+            with connection.cursor() as cursor:
+                load_id = start_load_audit(
+                    cursor=cursor,
+                    dag_id=context["dag"].dag_id,
+                    airflow_run_id=dag_run.run_id,
+                    run_date=run_date,
+                    target_table=target_table,
+                    source_path=source_path,
+                )
+
+                cursor.execute(
+                    f"""
+                    DELETE FROM {target_table}
+                    WHERE {partition_column} = %s
+                    """,
+                    (run_date,),
+                )
+
+                rows_deleted = cursor.rowcount
+
+                rows_inserted = copy_dataframe_to_postgres(
+                    cursor=cursor,
+                    dataframe=dataframe,
+                    target_table=target_table,
+                    columns=expected_columns,
+                )
+
+                complete_load_audit(
+                    cursor=cursor,
+                    load_id=load_id,
+                    rows_deleted=rows_deleted,
+                    rows_inserted=rows_inserted,
+                )
+
+            connection.commit()
+
+        result = {
+            "load_name": load_name,
+            "target_table": target_table,
+            "run_date": run_date,
+            "rows_deleted": rows_deleted,
+            "rows_inserted": rows_inserted,
+            "source_path": source_path,
+        }
+
+        LOGGER.info(
+            "Warehouse load completed: %s",
+            json.dumps(result),
+        )
+
+        return result
+
+    except Exception as exc:
+        LOGGER.exception(
+            "Warehouse load failed for %s",
+            target_table,
+        )
+
+        record_failed_load_audit(
+            dag_id=context["dag"].dag_id,
+            airflow_run_id=dag_run.run_id,
+            run_date=run_date,
+            target_table=target_table,
+            source_path=source_path,
+            error_message=str(exc),
+        )
+
+        raise AirflowException(
+            f"Warehouse load failed for {target_table}: {exc}"
+        ) from exc
+        
+def verify_warehouse_loads(**context: Any) -> None:
+    task_instance = context["ti"]
+
+    task_ids = [
+        "warehouse_load.load_processed_trades",
+        "warehouse_load.load_portfolio_pnl",
+        "warehouse_load.load_rejected_records",
+        "warehouse_load.load_unresolvable_pnl",
+    ]
+
+    pulled_results = task_instance.xcom_pull(
+        task_ids=task_ids,
+    )
+
+    results = list(pulled_results or [])
+
+    if len(results) != len(task_ids):
+        raise AirflowException(
+            "One or more warehouse load results are missing."
+        )
+
+    invalid_results = [
+        task_id
+        for task_id, result in zip(task_ids, results)
+        if not isinstance(result, dict)
+    ]
+
+    if invalid_results:
+        raise AirflowException(
+            "Invalid warehouse load XCom results for: "
+            + ", ".join(invalid_results)
+        )
+
+    LOGGER.info(
+        "All warehouse loads completed successfully: %s",
+        json.dumps(results, default=str),
+    )
 
 default_args = {
     "owner": "fincore-data-engineering",
@@ -507,6 +1060,57 @@ with DAG(
         task_id="quality_gate_failed",
         python_callable=quality_failure,
     )
+    
+    with TaskGroup(
+        group_id="warehouse_load",
+        tooltip="Load processed data into the warehouse"
+    ) as warehouse_load_group:
+        
+        load_processed_trades = PythonOperator(
+        task_id="load_processed_trades",
+        python_callable=load_partition_to_warehouse,
+        op_kwargs={
+            "load_name": "processed_trades",
+        },
+        retries=2,
+        retry_delay=timedelta(minutes=5),
+        )
+
+        load_portfolio_pnl = PythonOperator(
+            task_id="load_portfolio_pnl",
+            python_callable=load_partition_to_warehouse,
+            op_kwargs={
+                "load_name": "portfolio_pnl",
+            },
+            retries=2,
+            retry_delay=timedelta(minutes=5),
+        )
+
+        load_rejected_records = PythonOperator(
+            task_id="load_rejected_records",
+            python_callable=load_partition_to_warehouse,
+            op_kwargs={
+                "load_name": "rejected_records",
+            },
+            retries=2,
+            retry_delay=timedelta(minutes=5),
+        )
+
+        load_unresolvable_pnl = PythonOperator(
+            task_id="load_unresolvable_pnl",
+            python_callable=load_partition_to_warehouse,
+            op_kwargs={
+                "load_name": "unresolvable_pnl",
+            },
+            retries=2,
+            retry_delay=timedelta(minutes=5),
+        )
+    
+    warehouse_load_complete = PythonOperator(
+    task_id="warehouse_load_complete",
+    python_callable=verify_warehouse_loads,
+    trigger_rule=TriggerRule.ALL_SUCCESS,
+    )
 
     start >> resolve_date
 
@@ -534,3 +1138,6 @@ with DAG(
         quality_gate_passed,
         quality_gate_failed,
     ]
+    
+    quality_gate_passed >> warehouse_load_group
+    warehouse_load_group >> warehouse_load_complete
