@@ -1,0 +1,60 @@
+version: 2
+
+models:
+  - name: stg_processed_trades
+    columns:
+      - name: order_id
+        tests:
+          - not_null
+
+      - name: portfolio_id
+        tests:
+          - not_null
+
+      - name: trade_date
+        tests:
+          - not_null
+
+      - name: side
+        tests:
+          - not_null
+          - accepted_values:
+              values:
+                - BUY
+                - SELL
+
+      - name: quantity
+        tests:
+          - not_null
+
+      - name: pnl_unresolvable
+        tests:
+          - not_null
+
+  - name: stg_portfolio_pnl
+    columns:
+      - name: portfolio_id
+        tests:
+          - not_null
+
+      - name: pnl_date
+        tests:
+          - not_null
+
+      - name: risk_status
+        description: This field is created in the downstream risk mart.
+
+  - name: stg_rejected_records
+    columns:
+      - name: rejection_id
+        tests:
+          - unique
+          - not_null
+
+      - name: source_name
+        tests:
+          - not_null
+
+      - name: rejection_rule
+        tests:
+          - not_null

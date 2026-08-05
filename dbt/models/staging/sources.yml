@@ -1,0 +1,29 @@
+version: 2
+
+sources:
+  - name: raw
+    database: fincore_warehouse
+    schema: raw
+
+    freshness:
+      warn_after:
+        count: 24
+        period: hour
+      error_after:
+        count: 48
+        period: hour
+
+    loaded_at_field: loaded_at
+
+    tables:
+      - name: processed_trades
+        description: Clean trade records produced by the Spark ETL.
+
+      - name: portfolio_pnl
+        description: Daily portfolio-level valuation and P&L output.
+
+      - name: rejected_records
+        description: Invalid source records rejected during Spark processing.
+
+      - name: unresolvable_pnl
+        description: Trades for which P&L could not be resolved.

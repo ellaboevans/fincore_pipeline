@@ -1,0 +1,51 @@
+version: 2
+
+models:
+  - name: fct_daily_trading_pnl
+    columns:
+      - name: trade_date
+        tests:
+          - not_null
+
+      - name: portfolio_id
+        tests:
+          - not_null
+
+      - name: symbol
+        tests:
+          - not_null
+
+      - name: trade_count
+        tests:
+          - not_null
+
+  - name: fct_portfolio_risk
+    columns:
+      - name: portfolio_id
+        tests:
+          - not_null
+
+      - name: pnl_date
+        tests:
+          - not_null
+
+      - name: risk_status
+        tests:
+          - accepted_values:
+              values:
+                - BREACH
+                - WITHIN_LIMIT
+
+  - name: fct_daily_data_quality
+    columns:
+      - name: run_date
+        tests:
+          - not_null
+
+      - name: source_name
+        tests:
+          - not_null
+
+      - name: rejection_rule
+        tests:
+          - not_null
