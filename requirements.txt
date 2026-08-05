@@ -2,3 +2,5 @@ apache-airflow-providers-amazon
 apache-airflow-providers-postgres
 boto3
 psycopg2-binary
+pyarrow
+pandas
