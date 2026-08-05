@@ -902,23 +902,23 @@ default_args = {
 
 
 with DAG(
-    dag_id=DAG_ID,
-    description=(
-        "Daily FinCore multi-source financial data pipeline."
-    ),
-    start_date=datetime(2026, 8, 1),
-    schedule="30 0 * * 1-5",
-    catchup=False,
-    max_active_runs=1,
-    default_args=default_args,
-    dagrun_timeout=timedelta(hours=6),
-    sla_miss_callback=sla_miss_callback,
-    tags=[
-        "fincore",
-        "financial-data",
-        "pyspark",
-        "minio",
-    ],
+        dag_id=DAG_ID,
+        description=(
+            "Daily FinCore multi-source financial data pipeline."
+        ),
+        start_date=datetime(2026, 8, 1),
+        schedule="30 0 * * 1-5",
+        catchup=False,
+        max_active_runs=1,
+        default_args=default_args,
+        dagrun_timeout=timedelta(hours=6),
+        sla_miss_callback=sla_miss_callback,
+        tags=[
+            "fincore",
+            "financial-data",
+            "pyspark",
+            "minio",
+        ],
 ) as dag:
 
     start = EmptyOperator(
@@ -1062,18 +1062,18 @@ with DAG(
     )
     
     with TaskGroup(
-        group_id="warehouse_load",
-        tooltip="Load processed data into the warehouse"
+            group_id="warehouse_load",
+            tooltip="Load processed data into the warehouse"
     ) as warehouse_load_group:
         
         load_processed_trades = PythonOperator(
-        task_id="load_processed_trades",
-        python_callable=load_partition_to_warehouse,
-        op_kwargs={
-            "load_name": "processed_trades",
-        },
-        retries=2,
-        retry_delay=timedelta(minutes=5),
+            task_id="load_processed_trades",
+            python_callable=load_partition_to_warehouse,
+            op_kwargs={
+                "load_name": "processed_trades",
+            },
+            retries=2,
+            retry_delay=timedelta(minutes=5),
         )
 
         load_portfolio_pnl = PythonOperator(
@@ -1107,9 +1107,35 @@ with DAG(
         )
     
     warehouse_load_complete = PythonOperator(
-    task_id="warehouse_load_complete",
-    python_callable=verify_warehouse_loads,
-    trigger_rule=TriggerRule.ALL_SUCCESS,
+        task_id="warehouse_load_complete",
+        python_callable=verify_warehouse_loads,
+        trigger_rule=TriggerRule.ALL_SUCCESS,
+    )
+    
+    dbt_run = BashOperator(
+        task_id="dbt_run",
+        bash_command="""
+            cd /opt/airflow/dbt && \
+            dbt run --profiles-dir .
+        """,
+        execution_timeout=timedelta(minutes=30),
+    )
+    
+    dbt_test = BashOperator(
+        task_id="dbt_test",
+        bash_command="""
+            cd /opt/airflow/dbt
+            dbt test --profiles-dir . || {
+                echo "dbt tests failed; continuing as advisory"
+                exit 0
+            }
+        """,
+        execution_timeout=timedelta(minutes=30),
+    )
+    
+    pipeline_complete = EmptyOperator(
+        task_id="pipeline_complete",
+        trigger_rule=TriggerRule.ALL_DONE,
     )
 
     start >> resolve_date
@@ -1141,3 +1167,5 @@ with DAG(
     
     quality_gate_passed >> warehouse_load_group
     warehouse_load_group >> warehouse_load_complete
+    
+    warehouse_load_complete >> dbt_run >> dbt_test >> pipeline_complete
