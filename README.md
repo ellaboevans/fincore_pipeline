@@ -208,6 +208,8 @@ The Spark job publishes metrics to MinIO. Airflow reads these metrics to evaluat
 - **Schedule:** Weekday schedule with maximum active runs set to 1 and a 6-hour runtime limit.
 - **Sensors:** Three parallel S3-compatible sensors (`mode: reschedule`, `poke interval: 10 minutes`, `timeout: 4 hours`).
 
+![Airflow_DAG_Graph_View](airflow-dag-graph.png)
+
 ---
 
 ## Warehouse Design
@@ -245,6 +247,8 @@ Grafana serves as the local CloudWatch dashboard equivalent under the name **Fin
 - Warehouse load durations and rejection rules breakdown
 
 > **Note on Business Metrics:** A negative P&L represents a normal market outcome and does not reflect a technical pipeline failure.
+
+![Grafana_Dashboard](grafana-dashboard.png)
 
 ---
 
