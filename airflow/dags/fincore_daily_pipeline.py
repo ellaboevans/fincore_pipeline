@@ -453,27 +453,62 @@ def choose_quality_gate_branch(**context: Any) -> str:
 
     quality_gate = metrics.get("quality_gate", {})
 
-    reject_rate = float(
-        quality_gate.get(
-            "trade_reject_rate",
-            metrics.get("reject_rate", 1.0),
-        )
+    # Both keys are published by the Spark job at the top level and
+    # inside quality_gate. A missing metric is an error, not a zero:
+    # defaulting would either wave bad data through or fail the gate
+    # for a reason nobody can diagnose from the logs.
+    reject_rate_value = quality_gate.get(
+        "trade_reject_rate",
+        metrics.get("trade_reject_rate"),
     )
 
-    unresolvable_count = int(
-        quality_gate.get(
-            "pnl_unresolvable_count",
-            metrics.get("pnl_unresolvable_count", 0),
-        )
+    unresolvable_value = quality_gate.get(
+        "pnl_unresolvable_count",
+        metrics.get("pnl_unresolvable_count"),
     )
 
+    missing_metrics = [
+        name
+        for name, value in (
+            ("trade_reject_rate", reject_rate_value),
+            ("pnl_unresolvable_count", unresolvable_value),
+        )
+        if value is None
+    ]
+
+    if missing_metrics:
+        raise AirflowException(
+            "Quality-gate metrics are missing from the Spark output: "
+            + ", ".join(missing_metrics)
+            + f". Received: {json.dumps(metrics)}"
+        )
+
+    reject_rate = float(reject_rate_value)
+    unresolvable_count = int(unresolvable_value)
+
+    # Airflow owns the gate decision rather than trusting the verdict
+    # Spark wrote, so the thresholds can be changed without a redeploy
+    # of the Spark job. Any disagreement between the two is logged.
     gate_passed = (
         reject_rate < TRADE_REJECT_RATE_THRESHOLD
         and unresolvable_count < PNL_UNRESOLVABLE_THRESHOLD
     )
 
+    spark_verdict = quality_gate.get("passed")
+
+    if spark_verdict is not None and bool(spark_verdict) != gate_passed:
+        LOGGER.warning(
+            "Quality-gate verdict disagrees with the Spark job: "
+            "airflow=%s spark=%s. Airflow thresholds are "
+            "reject_rate<%s and unresolvable<%s.",
+            gate_passed,
+            spark_verdict,
+            TRADE_REJECT_RATE_THRESHOLD,
+            PNL_UNRESOLVABLE_THRESHOLD,
+        )
+
     LOGGER.info(
-        "Quality gate result: reject_rate=%s threshold=%s "
+        "Quality gate result: trade_reject_rate=%s threshold=%s "
         "unresolvable_count=%s threshold=%s passed=%s",
         reject_rate,
         TRADE_REJECT_RATE_THRESHOLD,
@@ -1115,27 +1150,33 @@ with DAG(
     dbt_run = BashOperator(
         task_id="dbt_run",
         bash_command="""
-            cd /opt/airflow/dbt && \
+            set -euo pipefail
+            cd /opt/airflow/dbt
             dbt run --profiles-dir .
         """,
         execution_timeout=timedelta(minutes=30),
     )
-    
+
+    # dbt test failures fail the task. These tests are the last check
+    # on data that has already reached the warehouse, so swallowing a
+    # failure would leave the run green while the marts are wrong.
     dbt_test = BashOperator(
         task_id="dbt_test",
         bash_command="""
+            set -euo pipefail
             cd /opt/airflow/dbt
-            dbt test --profiles-dir . || {
-                echo "dbt tests failed; continuing as advisory"
-                exit 0
-            }
+            dbt test --profiles-dir .
         """,
         execution_timeout=timedelta(minutes=30),
     )
-    
+
+    # NONE_FAILED, not ALL_DONE: this is the only leaf on the success
+    # path, so the DAG run state is derived from it. Under ALL_DONE it
+    # would go green even when dbt_test failed upstream. NONE_FAILED
+    # still tolerates skipped upstreams from the quality-gate branch.
     pipeline_complete = EmptyOperator(
         task_id="pipeline_complete",
-        trigger_rule=TriggerRule.ALL_DONE,
+        trigger_rule=TriggerRule.NONE_FAILED,
     )
 
     start >> resolve_date
