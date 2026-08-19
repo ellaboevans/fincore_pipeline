@@ -202,6 +202,13 @@ The Spark job publishes metrics to MinIO. Airflow reads these metrics to evaluat
 - **Gate Passed:** Triggers warehouse loads $\rightarrow$ `dbt run` $\rightarrow$ `dbt test`
 - **Gate Failed:** Pipeline stops and alerts operations team; rejected branch is skipped.
 
+The trade reject rate is `trade rejections / total inbound trades`. Market-data
+and portfolio rejections are reported separately (`rejection_count_by_source`,
+`overall_reject_rate`) and are deliberately kept out of the gate numerator, so a
+bad market-data feed cannot fail the gate on a trade-quality metric. Airflow
+evaluates the thresholds itself rather than trusting the verdict Spark wrote,
+and logs any disagreement between the two.
+
 ### DAG Specifications
 
 - **Name:** `fincore_daily_pipeline`
@@ -305,6 +312,18 @@ docker compose ps
 
 ### Initialize the Warehouse & Generate Data
 
+On a **fresh** warehouse volume the schemas, tables, and monitoring views are
+created automatically by the Postgres entrypoint, in this order:
+
+| Order | Script                                | Creates            |
+| ----- | ------------------------------------- | ------------------ |
+| 01    | `scripts/init-warehouse.sql`          | Schemas            |
+| 02    | `scripts/create-warehouse-tables.sql` | Tables and indexes |
+| 03    | `scripts/create-monitoring-views.sql` | Monitoring views   |
+
+To re-apply them against an **existing** volume (both are idempotent —
+`CREATE TABLE IF NOT EXISTS` / `CREATE OR REPLACE VIEW`):
+
 ```bash
 # Create warehouse tables
 docker compose exec -T warehouse-db psql -U "$WAREHOUSE_USER" -d "$WAREHOUSE_DB" < scripts/create-warehouse-tables.sql
@@ -320,12 +339,11 @@ python3 data-generator/generate_sample_data.py --run-date 2026-08-03
 ### Upload Sample Data to MinIO & Run Spark
 
 ```bash
-docker compose run --rm -v "$PWD/data/generated:/data-import:ro" --entrypoint /bin/sh minio-init -c '
-  mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"
-  mc cp --recursive /data-import/trades/ local/fincore-raw/trades/
-  mc cp --recursive /data-import/market_data/ local/fincore-raw/market_data/
-  mc cp --recursive /data-import/portfolio/ local/fincore-raw/portfolio/
-'
+# Create buckets and upload one run-date partition (idempotent)
+docker compose run --rm \
+  -v "$PWD/scripts:/scripts:ro" \
+  -v "$PWD/data/generated:/data-import:ro" \
+  --entrypoint /bin/sh minio-init /scripts/init-minio.sh 2026-08-03
 
 # Run Spark ETL job manually
 docker compose exec spark-master /bin/bash -lc '
