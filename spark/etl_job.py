@@ -36,6 +36,17 @@ FIX_TIMESTAMP_FORMAT = "yyyyMMdd-HH:mm:ss"
 SIDE_BUY = "BUY"
 SIDE_SELL = "SELL"
 
+SOURCE_TRADES = "trades"
+SOURCE_MARKET_DATA = "market_data"
+SOURCE_PORTFOLIO = "portfolio"
+
+# Quality-gate thresholds. The trade reject rate is defined as
+# trade rejections / total inbound trades, so it is comparable with
+# monitoring.v_daily_quality_metrics, which computes the same ratio
+# from the warehouse.
+TRADE_REJECT_RATE_THRESHOLD = 0.02
+PNL_UNRESOLVABLE_THRESHOLD = 100
+
 DECIMAL_ZERO = Decimal("0")
 DECIMAL_ONE = Decimal("1")
 
@@ -370,7 +381,7 @@ def parse_fix_trades(
 
     rejected = rejected_record(
         rejected_source,
-        source_name="trades",
+        source_name=SOURCE_TRADES,
         run_date=run_date,
         identifier_column=F.col("order_id"),
         raw_record_column=F.col("raw_record"),
@@ -503,7 +514,7 @@ def process_market_data(
 
     rejected = rejected_record(
         rejected_source,
-        source_name="market_data",
+        source_name=SOURCE_MARKET_DATA,
         run_date=run_date,
         identifier_column=F.col("symbol"),
         raw_record_column=F.to_json(
@@ -792,7 +803,7 @@ def process_portfolios(
 
     base_rejections = rejected_record(
         base_rejected,
-        source_name="portfolio",
+        source_name=SOURCE_PORTFOLIO,
         run_date=run_date,
         identifier_column=F.col("portfolio_id"),
         raw_record_column=F.to_json(
@@ -810,7 +821,7 @@ def process_portfolios(
 
     market_rejections = rejected_record(
         market_rejected_source,
-        source_name="portfolio",
+        source_name=SOURCE_PORTFOLIO,
         run_date=run_date,
         identifier_column=F.concat_ws(
             ":",
@@ -958,18 +969,29 @@ def calculate_trade_pnl(
 
 def collect_rejection_counts(
     rejected: DataFrame,
-) -> dict[str, int]:
+) -> list[tuple[str, str, int]]:
+    """
+    Count rejections once, grouped by source and rule.
+
+    Returning the raw (source, rule, count) triples lets the caller
+    derive both the per-rule and the per-source breakdown from a
+    single Spark action.
+    """
     rows = (
         rejected
-        .groupBy("rejection_rule")
+        .groupBy("source_name", "rejection_rule")
         .count()
         .collect()
     )
 
-    return {
-        row["rejection_rule"]: int(row["count"])
+    return [
+        (
+            row["source_name"],
+            row["rejection_rule"],
+            int(row["count"]),
+        )
         for row in rows
-    }
+    ]
 
 
 def build_metrics(
@@ -983,12 +1005,46 @@ def build_metrics(
     portfolio_count: int,
 ) -> dict[str, Any]:
     rejection_counts = collect_rejection_counts(rejected)
-    total_rejection_count = sum(rejection_counts.values())
 
-    reject_rate = (
+    rejection_count_by_rule: dict[str, int] = {}
+    rejection_count_by_source: dict[str, int] = {}
+
+    for source_name, rejection_rule, count in rejection_counts:
+        rejection_count_by_rule[rejection_rule] = (
+            rejection_count_by_rule.get(rejection_rule, 0) + count
+        )
+        rejection_count_by_source[source_name] = (
+            rejection_count_by_source.get(source_name, 0) + count
+        )
+
+    total_rejection_count = sum(rejection_count_by_rule.values())
+
+    trade_rejection_count = rejection_count_by_source.get(
+        SOURCE_TRADES,
+        0,
+    )
+
+    # The gate measures trade quality, so only trade rejections may
+    # appear in the numerator. Mixing in market-data and portfolio
+    # rejections would inflate the rate against a trade-only
+    # denominator and would not match the equivalent warehouse view.
+    trade_reject_rate = (
+        trade_rejection_count / total_trade_count
+        if total_trade_count
+        else 0.0
+    )
+
+    # Reported separately because it is a useful operational signal,
+    # but it is deliberately not what the gate is evaluated against.
+    overall_reject_rate = (
         total_rejection_count / total_trade_count
         if total_trade_count
         else 0.0
+    )
+
+    gate_passed = (
+        trade_reject_rate < TRADE_REJECT_RATE_THRESHOLD
+        and unresolvable_count < PNL_UNRESOLVABLE_THRESHOLD
     )
 
     return {
@@ -996,21 +1052,27 @@ def build_metrics(
         "run_date": run_date,
         "total_trade_count": total_trade_count,
         "clean_trade_count": clean_trade_count,
+        "trade_rejection_count": trade_rejection_count,
         "total_rejection_count": total_rejection_count,
-        "rejection_count_by_rule": rejection_counts,
-        "reject_rate": round(reject_rate, 6),
+        "rejection_count_by_rule": rejection_count_by_rule,
+        "rejection_count_by_source": rejection_count_by_source,
+        "trade_reject_rate": round(trade_reject_rate, 6),
+        "overall_reject_rate": round(overall_reject_rate, 6),
         "pnl_unresolvable_count": unresolvable_count,
         "total_realized_pnl_usd": str(
             total_realized_pnl or DECIMAL_ZERO
         ),
         "portfolio_pnl_count": portfolio_count,
         "quality_gate": {
-            "reject_rate_threshold": 0.02,
-            "pnl_unresolvable_threshold": 100,
-            "passed": (
-                reject_rate < 0.02
-                and unresolvable_count < 100
+            "trade_reject_rate": round(trade_reject_rate, 6),
+            "trade_reject_rate_threshold": (
+                TRADE_REJECT_RATE_THRESHOLD
             ),
+            "pnl_unresolvable_count": unresolvable_count,
+            "pnl_unresolvable_threshold": (
+                PNL_UNRESOLVABLE_THRESHOLD
+            ),
+            "passed": gate_passed,
         },
     }
 
