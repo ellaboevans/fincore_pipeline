@@ -82,17 +82,40 @@ services:
     depends_on:
       minio:
         condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000
-      ${MINIO_ROOT_USER}
-      ${MINIO_ROOT_PASSWORD};
+    # -e so any failing command aborts the script, -u so an unset
+    # credential is an error rather than an empty string. Commands are
+    # newline-separated, not ';'-chained, so a failure cannot be stepped
+    # over. Credentials are written as $$VAR so the container's shell
+    # expands them from env_file at runtime, instead of Compose baking
+    # them into `docker compose config` output.
+    entrypoint:
+      - /bin/sh
+      - -euc
+      - |
+        # minio reports healthy before DNS is reliably resolvable here,
+        # so retry the alias rather than racing it.
+        for attempt in $$(seq 1 30); do
+          if mc alias set local http://minio:9000 \
+               "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null 2>&1
+          then
+            break
+          fi
+          echo "Waiting for MinIO (attempt $$attempt/30)..."
+          sleep 2
+        done
 
-      mc mb --ignore-existing local/fincore-raw;
-      mc mb --ignore-existing local/fincore-processed;
+        # Unguarded, so exhausting the retries fails the container.
+        mc alias set local http://minio:9000 \
+          "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
 
-      echo 'MinIO buckets initialized successfully.';
-      "
+        mc mb --ignore-existing local/fincore-raw
+        mc mb --ignore-existing local/fincore-processed
+
+        # Report success only after confirming both buckets are real.
+        mc ls local/fincore-raw >/dev/null
+        mc ls local/fincore-processed >/dev/null
+
+        echo "MinIO buckets initialized successfully."
     restart: "no"
     networks:
       - fincore-network
@@ -109,7 +132,11 @@ services:
       - "5433:5432"
     volumes:
       - warehouse-db-data:/var/lib/postgresql/data
-      - ./scripts/init-warehouse.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      # Init scripts run once on a fresh volume, in lexical order.
+      # 01 creates schemas, 02 creates tables, 03 creates monitoring views.
+      - ./scripts/init-warehouse.sql:/docker-entrypoint-initdb.d/01-schemas.sql:ro
+      - ./scripts/create-warehouse-tables.sql:/docker-entrypoint-initdb.d/02-tables.sql:ro
+      - ./scripts/create-monitoring-views.sql:/docker-entrypoint-initdb.d/03-monitoring-views.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${WAREHOUSE_USER} -d ${WAREHOUSE_DB}"]
       interval: 10s
